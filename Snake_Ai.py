@@ -5,13 +5,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import time
+from collections import deque
 
-# Rozmiary okna gry 
-#(ustaw ręcznie jak ci odpowiada, czym większy rozmiar, tym efektywność nauki AI będzie zaburzona)
+# Rozmiary okna gry (ustawienia preferowane powinny lepiej działać w teście nauki)
 WIDTH, HEIGHT = 600, 400
 CELL_SIZE = 20
 
-# Kolory (ZIELONY TO GRACZ)
+# Kolory (zielony to gracz)
 WHITE = (255, 255, 255)
 GREEN = (0, 255, 0)
 RED = (255, 0, 0)
@@ -23,24 +23,41 @@ DOWN = (0, 1)
 LEFT = (-1, 0)
 RIGHT = (1, 0)
 
-# Inicjalizacja 
+# Pygame
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 clock = pygame.time.Clock()
 
-# Prosty Model AI
+# Model AI
 class SnakeAI(nn.Module):
     def __init__(self):
         super(SnakeAI, self).__init__()
         self.fc1 = nn.Linear(16, 128)
-        self.fc2 = nn.Linear(128, 4)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 4)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
-        x = self.fc2(x)
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
         return x
 
-def ai_move(snake, apple):
+# Buffer doświadczeń (NAUKA)
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, experience):
+        self.buffer.append(experience)
+
+    def sample(self, batch_size):
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        return [self.buffer[i] for i in indices]
+
+    def __len__(self):
+        return len(self.buffer)
+
+def ai_move(snake, apple, epsilon):
     state = get_state(snake, apple)
     state_tensor = torch.FloatTensor(state).unsqueeze(0)
     if random.random() < epsilon:
@@ -151,17 +168,25 @@ def display_end_message(message):
                     pygame.quit()
                     return "quit"
 
-# Funkcja główna gry - DO zoptymalizowania
+# Funkcja główna gry
 def main():
-    global ai, epsilon, gamma
+    global ai, target_ai, optimizer, criterion, epsilon, gamma, buffer, batch_size, target_update
     ai = SnakeAI()
+    target_ai = SnakeAI()
+    target_ai.load_state_dict(ai.state_dict())
     optimizer = optim.Adam(ai.parameters(), lr=0.001)
     criterion = nn.MSELoss()
 
-    epsilon = 0.1  # Współczynnik eksploracji
+    epsilon = 1.0  # Początkowa wartość eksploracji
+    epsilon_min = 0.1  # Minimalna wartość eksploracji
+    epsilon_decay = 0.995  # Tempo zmniejszania eksploracji
     gamma = 0.9  # Współczynnik dyskontowy
+    buffer = ReplayBuffer(capacity=10000)  # Bufor doświadczeń
+    batch_size = 64  # Rozmiar paczki do nauki
+    target_update = 100  # Co ile kroków aktualizować sieć docelową
 
     running = True
+    steps_done = 0
     while running:
         snake1 = Snake(WIDTH // 2, HEIGHT // 2)
         snake2 = Snake(WIDTH // 4, HEIGHT // 4)
@@ -172,6 +197,9 @@ def main():
         game_duration = 300  # Czas gry w sekundach (5 minut)
 
         while True:
+            if not running:
+                break  # Wyjście z pętli gry, jeśli okno zostało zamknięte
+
             screen.fill(BLACK)
             elapsed_time = time.time() - game_start_time
 
@@ -179,6 +207,10 @@ def main():
                 if event.type == pygame.QUIT:
                     pygame.quit()
                     return
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_q:
+                        pygame.quit()
+                        return
 
             if elapsed_time >= game_duration:
                 # Koniec gry - ogłoszenie zwycięzcy
@@ -196,7 +228,7 @@ def main():
                     return
 
             if ai_lives > 0:
-                # Ruch sterowanego węża (MOŻNA USTAWIĆ WŁASNE STEROWANIE)
+                # Ruch sterowanego węża
                 keys = pygame.key.get_pressed()
                 if keys[pygame.K_UP] and snake1.direction != DOWN:
                     snake1.direction = UP
@@ -209,8 +241,8 @@ def main():
 
                 snake1.move()
 
-                # Ruch AI
-                direction, action = ai_move(snake2, apple)
+                # Ruch węża AI
+                direction, action = ai_move(snake2, apple, epsilon)
                 snake2.direction = direction
                 snake2.move()
 
@@ -236,22 +268,39 @@ def main():
                     apple = (random.randint(0, (WIDTH - CELL_SIZE) // CELL_SIZE) * CELL_SIZE,
                              random.randint(0, (HEIGHT - CELL_SIZE) // CELL_SIZE) * CELL_SIZE)
 
-                # Update tabeli
+                # Update Q-tabeli
                 next_state = get_state(snake2, apple)
-                next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
-                with torch.no_grad():
-                    next_action = ai(next_state_tensor).argmax().item()
-                current_q = ai(next_state_tensor)[0, action]
-                next_q = ai(next_state_tensor)[0, next_action]
                 reward = 10 if snake2.body[0] == apple else -10 if snake2.check_collision() else 0
-                target_q = reward + gamma * next_q
+                buffer.push((get_state(snake2, apple), action, reward, next_state))
 
-                target_q_tensor = torch.tensor([target_q])
-                loss = criterion(current_q, target_q_tensor)
+                if len(buffer) >= batch_size:
+                    experiences = buffer.sample(batch_size)
+                    batch_state, batch_action, batch_reward, batch_next_state = zip(*experiences)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                    batch_state_tensor = torch.FloatTensor(batch_state)
+                    batch_action_tensor = torch.LongTensor(batch_action)
+                    batch_reward_tensor = torch.FloatTensor(batch_reward)
+                    batch_next_state_tensor = torch.FloatTensor(batch_next_state)
+
+                    # Obliczanie Q wartości
+                    current_q = ai(batch_state_tensor).gather(1, batch_action_tensor.unsqueeze(1)).squeeze(1)
+                    next_q = target_ai(batch_next_state_tensor).max(1)[0]
+                    target_q = batch_reward_tensor + gamma * next_q
+
+                    loss = criterion(current_q, target_q)
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    # Aktualizacja sieci docelowej
+                    if steps_done % target_update == 0:
+                        target_ai.load_state_dict(ai.state_dict())
+
+                    steps_done += 1
+
+                # Zmniejszenie wartości epsilon
+                epsilon = max(epsilon_min, epsilon * epsilon_decay)
 
                 # Rysowanie węży, jabłka i licznika czasu
                 pygame.draw.rect(screen, RED, (*apple, CELL_SIZE, CELL_SIZE))
